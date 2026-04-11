@@ -1,0 +1,90 @@
+# Disease-to-Urgency Triage Mapping Protocol
+
+mapping:
+  high_urgency:
+    label: 2
+    urgency_level: "HIGH"
+    processing_time_days: 1
+    conditions:
+      - "Severe Non-Proliferative DR (NPDR)"
+      - "Proliferative Diabetic Retinopathy (PDR)"
+      - "Advanced DR with neovascularization"
+      - "High risk of vision loss"
+    aptos_dr_levels: [3, 4]
+    clinical_basis: "NHS DESP R3, AAO PPP Severe NPDR/PDR"
+    min_confidence: 0.70
+
+  medium_urgency:
+    label: 1
+    urgency_level: "MEDIUM"
+    processing_time_days: 28
+    conditions:
+      - "Moderate Non-Proliferative DR (NPDR)"
+      - "Multiple retinal hemorrhages and microaneurysms"
+      - "Cotton wool spots present"
+      - "Venous beading in multiple quadrants"
+    aptos_dr_levels: [2]
+    clinical_basis: "NHS DESP R2, AAO PPP Moderate NPDR"
+    min_confidence: 0.60
+
+  low_urgency:
+    label: 0
+    urgency_level: "LOW"
+    processing_time_days: 365
+    conditions:
+      - "No Diabetic Retinopathy"
+      - "Mild Non-Proliferative DR"
+      - "Minimal background retinopathy"
+      - "Few microaneurysms only"
+    aptos_dr_levels: [0, 1]
+    clinical_basis: "NHS DESP R0-R1, AAO PPP No DR/Mild NPDR"
+    min_confidence: 0.50
+
+aptos_diagnosis_codes:
+  0: "No DR"
+  1: "Mild NPDR"
+  2: "Moderate NPDR"
+  3: "Severe NPDR"
+  4: "Proliferative DR (PDR)"
+
+automated_mapping:
+  rules:
+    - dr_severity: 0
+      map_to: "LOW"
+      rationale: "No retinopathy detected, annual screening"
+
+    - dr_severity: 1
+      map_to: "LOW"
+      rationale: "Minimal changes, annual monitoring sufficient"
+
+    - dr_severity: 2
+      map_to: "MEDIUM"
+      rationale: "Multiple lesions, routine referral needed"
+
+    - dr_severity: 3
+      map_to: "HIGH"
+      rationale: "High risk of progression, urgent referral"
+
+    - dr_severity: 4
+      map_to: "HIGH"
+      rationale: "Sight-threatening, immediate ophthalmology review"
+
+validation:
+  bilateral_required: true
+  target_distribution:
+    LOW: 0.50
+    MEDIUM: 0.30
+    HIGH: 0.20
+  min_model_confidence: 0.50
+  uncertain_threshold: 0.55
+  gold_standard_examples:
+    HIGH:
+      - "PDR with VH and DMO"
+      - "CRAO"
+      - "Retinal Detachment"
+    MEDIUM:
+      - "Moderate NPDR with CWS"
+      - "Glaucoma suspect"
+    LOW:
+      - "Normal fundus"
+      - "Mild background DR"

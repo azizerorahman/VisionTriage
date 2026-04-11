@@ -1,0 +1,116 @@
+# Configuration
+
+# Dataset Configuration
+dataset:
+  name: "IDRiD"
+  raw_path: "your_path/DiseaseGrading"
+  processed_path: "your_path/data/processed"
+  splits_path: "your_path/data/splits"
+  image_size: 512
+  num_classes: 3 # Low, Medium, High urgency
+  test_split: 0.2
+  val_split: 0.1
+  random_seed: 42
+
+  # IDRiD-specific settings
+  train_csv: "your_path/IDRiD_Disease_Grading_Training_Labels.csv"
+  test_csv: "your_path/Groundtruths/IDRiD_Disease_Grading_Testing_Labels.csv"
+  train_image_dir: "your_path/Original_Images/a.Training_Set"
+  test_image_dir: "your_path/Original Images/b.Testing_Set"
+  image_format: "jpg"
+  diagnosis_column: "Retinopathy grade" # DR severity: 0-4
+
+# Model Configurations
+models:
+  # Baseline 1: CNN Monocular
+  baseline_cnn:
+    name: "ResNet50-Monocular"
+    backbone: "resnet50"
+    pretrained: true
+    input_channels: 3
+    output_features: 2048
+    fc_hidden_dim: 512
+
+  # Baseline 2: ViT Monocular
+  baseline_vit:
+    name: "ViT-Base-Monocular"
+    backbone: "vit_base_patch16_224"
+    pretrained: true
+    patch_size: 16
+    output_features: 768
+    fc_hidden_dim: 512
+
+  # Baseline 3: Late Concatenation Fusion
+  baseline_concat:
+    name: "ResNet50-Late-Concat"
+    backbone: "resnet50"
+    pretrained: true
+    fusion_type: "concat"
+    fc_hidden_dim: 1024
+
+  # Proposed: Cross-Attention Fusion
+  proposed_crossattn:
+    name: "ResNet50-Cross-Attention"
+    backbone: "resnet50"
+    pretrained: true
+    fusion_type: "cross_attention"
+    num_heads: 8
+    attn_dim: 256
+    num_attn_layers: 2
+    fc_hidden_dim: 512
+
+# Training Configuration
+training:
+  batch_size: 32
+  num_epochs: 50
+  learning_rate: 1e-4
+  weight_decay: 1e-5
+  optimizer: "Adam"
+  scheduler: "CosineAnnealingLR"
+  warmup_epochs: 5
+  gradient_clip: 1.0
+
+  # Loss function
+  loss_fn: "CrossEntropyLoss"
+  class_weights: [1.0, 1.5, 2.0] # Weight high urgency higher
+
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 10
+    monitor: "val_f1"
+    mode: "max"
+
+# Data Augmentation
+augmentation:
+  train:
+    - RandomRotate: { limit: 15 }
+    - RandomBrightnessContrast: { brightness_limit: 0.2, contrast_limit: 0.2 }
+    - GaussNoise: { var_limit: [10.0, 50.0] }
+    - RandomGamma: {}
+    - Normalize: { mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225] }
+
+  val:
+    - Normalize: { mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225] }
+
+# Logging & Monitoring
+logging:
+  log_dir: "your_path/experiments/logs"
+  checkpoint_dir: "your_path/models"
+  tensorboard_dir: "your_path/experiments/tensorboard"
+  log_interval: 100 # Log every N batches
+  save_interval: 5 # Save checkpoint every N epochs
+
+# GPU Configuration
+gpu:
+  device: "cuda" # "cuda" or "cpu"
+  num_workers: 4
+  pin_memory: true
+  mixed_precision: true
+
+# Reproducibility
+reproducibility:
+  random_seed: 42
+  deterministic: true
+  benchmark: false
+  reproducible
