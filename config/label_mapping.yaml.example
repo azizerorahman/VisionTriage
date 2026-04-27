@@ -1,90 +1,64 @@
-# Disease-to-Urgency Triage Mapping Protocol
+# VisionTriage Label Mapping Protocol
 
-mapping:
-  high_urgency:
-    label: 2
-    urgency_level: "HIGH"
-    processing_time_days: 1
-    conditions:
-      - "Severe Non-Proliferative DR (NPDR)"
-      - "Proliferative Diabetic Retinopathy (PDR)"
-      - "Advanced DR with neovascularization"
-      - "High risk of vision loss"
-    aptos_dr_levels: [3, 4]
-    clinical_basis: "NHS DESP R3, AAO PPP Severe NPDR/PDR"
-    min_confidence: 0.70
+# ── ETDRS 5-Class ───────────────────────────
 
-  medium_urgency:
-    label: 1
-    urgency_level: "MEDIUM"
-    processing_time_days: 28
-    conditions:
-      - "Moderate Non-Proliferative DR (NPDR)"
-      - "Multiple retinal hemorrhages and microaneurysms"
-      - "Cotton wool spots present"
-      - "Venous beading in multiple quadrants"
-    aptos_dr_levels: [2]
-    clinical_basis: "NHS DESP R2, AAO PPP Moderate NPDR"
-    min_confidence: 0.60
+# Grade 0: No DR          → Low   (annual recall)
+# Grade 1: Mild NPDR      → Low   (annual recall)
+# Grade 2: Moderate NPDR  → Medium (4-8 week review)
+# Grade 3: Severe NPDR    → High  (urgent, within 1 week)
+# Grade 4: PDR            → High  (same-day or within 1 week)
 
-  low_urgency:
+idrid_etdrs_mapping:
+  0: 0    # No DR           → Low
+  1: 0    # Mild NPDR       → Low
+  2: 1    # Moderate NPDR   → Medium
+  3: 2    # Severe NPDR     → High
+  4: 2    # PDR             → High
+
+# ── Binary ───────────────────────────────────
+
+# DR absent  → Low  (no pathology detected)
+# DR present → High (conservative: assume worst case)
+# Medium tier intentionally excluded — binary label cannot
+# distinguish moderate from severe DR
+
+dodr_binary_mapping:
+  0: 0    # DR absent  → Low
+  1: 2    # DR present → High
+
+# ── Urgency Tier ──────────────────────────────────────────
+urgency_tiers:
+  low:
     label: 0
-    urgency_level: "LOW"
-    processing_time_days: 365
-    conditions:
-      - "No Diabetic Retinopathy"
-      - "Mild Non-Proliferative DR"
-      - "Minimal background retinopathy"
-      - "Few microaneurysms only"
-    aptos_dr_levels: [0, 1]
-    clinical_basis: "NHS DESP R0-R1, AAO PPP No DR/Mild NPDR"
-    min_confidence: 0.50
+    name: "LOW"
+    clinical_action: "Annual recall"
+    timeframe_days: 365
+    etdrs_grades: [0, 1]
+    clinical_basis: "NHS DESP R0-R1, AAO PPP No DR / Mild NPDR"
 
-aptos_diagnosis_codes:
-  0: "No DR"
-  1: "Mild NPDR"
-  2: "Moderate NPDR"
-  3: "Severe NPDR"
-  4: "Proliferative DR (PDR)"
+  medium:
+    label: 1
+    name: "MEDIUM"
+    clinical_action: "Specialist review"
+    timeframe_days: 28
+    etdrs_grades: [2]
+    clinical_basis: "NHS DESP R2, AAO PPP Moderate NPDR"
 
-automated_mapping:
-  rules:
-    - dr_severity: 0
-      map_to: "LOW"
-      rationale: "No retinopathy detected, annual screening"
+  high:
+    label: 2
+    name: "HIGH"
+    clinical_action: "Urgent referral"
+    timeframe_days: 7
+    etdrs_grades: [3, 4]
+    clinical_basis: "NHS DESP R3, AAO PPP Severe NPDR / PDR"
 
-    - dr_severity: 1
-      map_to: "LOW"
-      rationale: "Minimal changes, annual monitoring sufficient"
+# ── Class Weights ─────────────────────────────────────────────────────
+idrid_only_weights:
+  low: 1.00
+  medium: 1.87
+  high: 2.84
 
-    - dr_severity: 2
-      map_to: "MEDIUM"
-      rationale: "Multiple lesions, routine referral needed"
-
-    - dr_severity: 3
-      map_to: "HIGH"
-      rationale: "High risk of progression, urgent referral"
-
-    - dr_severity: 4
-      map_to: "HIGH"
-      rationale: "Sight-threatening, immediate ophthalmology review"
-
-validation:
-  bilateral_required: true
-  target_distribution:
-    LOW: 0.50
-    MEDIUM: 0.30
-    HIGH: 0.20
-  min_model_confidence: 0.50
-  uncertain_threshold: 0.55
-  gold_standard_examples:
-    HIGH:
-      - "PDR with VH and DMO"
-      - "CRAO"
-      - "Retinal Detachment"
-    MEDIUM:
-      - "Moderate NPDR with CWS"
-      - "Glaucoma suspect"
-    LOW:
-      - "Normal fundus"
-      - "Mild background DR"
+multisource_weights:
+  low: 1.00
+  medium: 13.09
+  high: 1.12

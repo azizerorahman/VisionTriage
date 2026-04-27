@@ -1,116 +1,143 @@
-# Configuration
+# VisionTriage Configuration
+# Copy to config.yaml and update paths for your environment
 
-# Dataset Configuration
+# ── Dataset Configuration ─────────────────────────────────────────────
 dataset:
   name: "IDRiD"
+
+  # Raw IDRiD dataset paths (update these)
   raw_path: "your_path/DiseaseGrading"
   processed_path: "your_path/data/processed"
   splits_path: "your_path/data/splits"
-  image_size: 512
-  num_classes: 3 # Low, Medium, High urgency
-  test_split: 0.2
-  val_split: 0.1
-  random_seed: 42
 
-  # IDRiD-specific settings
+  # IDRiD CSV files
   train_csv: "your_path/IDRiD_Disease_Grading_Training_Labels.csv"
   test_csv: "your_path/Groundtruths/IDRiD_Disease_Grading_Testing_Labels.csv"
-  train_image_dir: "your_path/Original_Images/a.Training_Set"
-  test_image_dir: "your_path/Original Images/b.Testing_Set"
-  image_format: "jpg"
-  diagnosis_column: "Retinopathy grade" # DR severity: 0-4
 
-# Model Configurations
+  # IDRiD image directories
+  train_image_dir: "your_path/Original_Images/a. Training Set"
+  test_image_dir: "your_path/Original_Images/b. Testing Set"
+
+  image_format: "jpg"
+  diagnosis_column: "Retinopathy grade"
+
+  # Image dimensions
+  resize_to: 512
+  crop_to: 480
+
+  num_classes: 3
+  random_seed: 42
+
+# ── Model Configurations ──────────────────────────────────────────────
 models:
-  # Baseline 1: CNN Monocular
+
+  # M1
   baseline_cnn:
-    name: "ResNet50-Monocular"
+    name: "M1-ResNet50-Monocular"
     backbone: "resnet50"
     pretrained: true
     input_channels: 3
     output_features: 2048
-    fc_hidden_dim: 512
+    dropout: 0.5
 
-  # Baseline 2: ViT Monocular
-  baseline_vit:
-    name: "ViT-Base-Monocular"
-    backbone: "vit_base_patch16_224"
-    pretrained: true
-    patch_size: 16
-    output_features: 768
-    fc_hidden_dim: 512
-
-  # Baseline 3: Late Concatenation Fusion
+  # M2
   baseline_concat:
-    name: "ResNet50-Late-Concat"
+    name: "M2-ResNet50-LateConcat"
     backbone: "resnet50"
     pretrained: true
     fusion_type: "concat"
     fc_hidden_dim: 1024
+    dropout: 0.5
 
-  # Proposed: Cross-Attention Fusion
+  # M3
   proposed_crossattn:
-    name: "ResNet50-Cross-Attention"
+    name: "M3-ResNet50-CrossAttention"
     backbone: "resnet50"
     pretrained: true
     fusion_type: "cross_attention"
     num_heads: 8
     attn_dim: 256
-    num_attn_layers: 2
     fc_hidden_dim: 512
+    dropout: 0.5
 
-# Training Configuration
+# ── Training Configuration ────────────────────────────────────────────
 training:
   batch_size: 32
   num_epochs: 50
-  learning_rate: 1e-4
-  weight_decay: 1e-5
-  optimizer: "Adam"
-  scheduler: "CosineAnnealingLR"
-  warmup_epochs: 5
-  gradient_clip: 1.0
 
-  # Loss function
-  loss_fn: "CrossEntropyLoss"
-  class_weights: [1.0, 1.5, 2.0] # Weight high urgency higher
+  # AdamW optimizer
+  optimizer: "adamw"
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+
+  # Cosine annealing scheduler
+  scheduler: "cosine_annealing"
+  t_max: 50
+  eta_min: 0.0
 
   # Early stopping
   early_stopping:
-    enabled: true
     patience: 10
-    monitor: "val_f1"
+    monitor: "val_macro_f1"
     mode: "max"
+    min_delta: 0.001
 
-# Data Augmentation
+  class_weights: [1.00, 1.87, 2.84]
+
+  # Dropout regularization
+  dropout: 0.5
+
+# ── Data Augmentation ─────────────────────────
 augmentation:
-  train:
-    - RandomRotate: { limit: 15 }
-    - RandomBrightnessContrast: { brightness_limit: 0.2, contrast_limit: 0.2 }
-    - GaussNoise: { var_limit: [10.0, 50.0] }
-    - RandomGamma: {}
-    - Normalize: { mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225] }
+  enabled: true
 
-  val:
-    - Normalize: { mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225] }
+  horizontal_flip:
+    enabled: true
+    probability: 0.5
 
-# Logging & Monitoring
-logging:
-  log_dir: "your_path/experiments/logs"
-  checkpoint_dir: "your_path/models"
-  tensorboard_dir: "your_path/experiments/tensorboard"
-  log_interval: 100 # Log every N batches
-  save_interval: 5 # Save checkpoint every N epochs
+  rotation:
+    enabled: true
+    degrees: 30
+    probability: 0.7
 
-# GPU Configuration
-gpu:
-  device: "cuda" # "cuda" or "cpu"
-  num_workers: 4
-  pin_memory: true
-  mixed_precision: true
+  color_jitter:
+    enabled: true
+    probability: 0.5
+    brightness: 0.2
+    contrast: 0.2
+    saturation: 0.1
+    hue: 0.0
 
-# Reproducibility
+  random_resized_crop:
+    enabled: true
+    size: 480
+    scale_min: 0.8
+    scale_max: 1.0
+
+# ── Preprocessing ─────────────────────────────
+preprocessing:
+  clahe:
+    clip_limit: 2.0
+    tile_grid_size: 8
+
+  normalization:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225] 
+
+# ── Reproducibility ───────────────────────────────────────────────────
 reproducibility:
-  random_seed: 42
+  seeds: [42, 0, 123]
   deterministic: true
-  benchmark: false
-  reproducible
+
+# ── GPU / Hardware ────────────────────────────────────────────────────
+gpu:
+  device: "cuda"                # "cpu" if no GPU
+  num_workers: 4                # Adjust to CPU core count
+  pin_memory: true
+
+# ── Logging ───────────────────────────────────────────────────────────
+logging:
+  tensorboard_dir: "runs"
+  checkpoint_dir: "checkpoints"
+  metrics_dir: "results"
+  log_interval: 10

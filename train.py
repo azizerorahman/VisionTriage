@@ -1,396 +1,522 @@
+import argparse
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-import yaml
-from pathlib import Path
-import sys
 from tqdm import tqdm
-import argparse
-import random
+import yaml
 
-import numpy as np
-import pandas as pd
+sys.path.insert(0, str(Path(__file__).parent))
 
-sys.path.append('/')
-
-from src.models import get_baseline_cnn, get_late_concat_model, get_cross_attention_model
-from src.data.dataloader import get_dataloaders
-from src.utils.metrics import MetricsTracker, save_checkpoint, save_metrics_json, EarlyStopping
-
+from src.models import get_model
+from src.data.dataloader import get_dataloaders, get_multisource_dataloaders
+from src.utils.metrics import (
+    MetricsTracker,
+    EarlyStopping,
+    compute_seed_robustness,
+    save_checkpoint,
+    save_metrics_json,
+)
 
 def set_seed(seed):
-    """Set random seed for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark     = False
+    print(f"  Seed set: {seed}")
 
+def compute_class_weights(train_loader, device, num_classes=3):
+    counts = torch.zeros(num_classes)
 
-def compute_auto_class_weights(train_csv):
-    # Compute inverse-frequency class weights
-    df = pd.read_csv(train_csv)
+    for batch in train_loader:
+        inputs, labels, _ = batch
+        for c in range(num_classes):
+            counts[c] += (labels == c).sum().item()
 
-    if 'urgency_label' in df.columns:
-        labels = df['urgency_label'].astype(int)
-    elif 'urgency' in df.columns:
-        mapping = {'LOW': 0, 'MEDIUM': 1, 'HIGH': 2}
-        labels = df['urgency'].astype(str).str.upper().map(mapping)
-        if labels.isna().any():
-            raise ValueError('Found unknown urgency values while computing class weights.')
-        labels = labels.astype(int)
-    else:
-        raise ValueError('Training CSV must contain urgency_label or urgency column.')
+    max_count = counts.max()
+    weights   = max_count / counts
 
-    counts = labels.value_counts().to_dict()
-    total = len(labels)
-    num_classes = 3
+    # Handle any class with zero samples
+    weights[counts == 0] = 0.0
 
-    weights = []
-    for class_idx in range(num_classes):
-        class_count = counts.get(class_idx, 0)
-        if class_count == 0:
-            weights.append(0.0)
+    print(f"  Class counts:  {counts.tolist()}")
+    print(f"  Class weights: {[f'{w:.4f}' for w in weights.tolist()]}")
+
+    return weights.to(device)
+
+def forward_pass(model, batch, is_bilateral, device):
+    inputs, labels, _ = batch
+    labels = labels.to(device)
+
+    if is_bilateral:
+        # inputs is a tuple (x_left, x_right)
+        if isinstance(inputs, (list, tuple)):
+            x_left  = inputs[0].to(device)
+            x_right = inputs[1].to(device)
         else:
-            weights.append(total / (num_classes * class_count))
+            x_left  = inputs.to(device)
+            x_right = torch.flip(x_left, dims=[3])
 
-    return weights
+        logits = model(x_left, x_right)
 
+    else:
+        # M1
+        if isinstance(inputs, (list, tuple)):
+            x = inputs[0].to(device)
+        else:
+            x = inputs.to(device)
 
-def _build_model(model_name, config, overrides=None):
-    if overrides is None:
-        overrides = {}
+        logits = model(x)
 
-    if model_name == 'baseline_cnn':
-        model_config = config['models']['baseline_cnn']
-        return get_baseline_cnn({
-            'num_classes': 3,
-            'pretrained': model_config['pretrained'],
-            'fc_hidden_dim': model_config['fc_hidden_dim'],
-            'dropout': 0.5,
-        }), model_config['name']
+    return logits, labels
 
-    if model_name == 'late_concat':
-        model_config = config['models']['baseline_concat']
-        return get_late_concat_model({
-            'num_classes': 3,
-            'pretrained': model_config['pretrained'],
-            'fc_hidden_dim': overrides.get('fc_hidden_dim', model_config['fc_hidden_dim']),
-            'dropout': 0.5,
-        }), model_config['name']
-
-    if model_name == 'cross_attention':
-        model_config = config['models']['proposed_crossattn']
-        return get_cross_attention_model({
-            'num_classes': 3,
-            'pretrained': model_config['pretrained'],
-            'attn_dim': overrides.get('attn_dim', model_config['attn_dim']),
-            'num_heads': overrides.get('num_heads', model_config['num_heads']),
-            'fc_hidden_dim': overrides.get('fc_hidden_dim', model_config['fc_hidden_dim']),
-            'dropout': 0.5,
-        }), model_config['name']
-
-    raise ValueError(f'Unknown model_name: {model_name}')
-
-
-def _forward_with_mode(model, model_name, images):
-    if model_name == 'baseline_cnn':
-        return model(images)
-
-    right_images = torch.flip(images, dims=[3])
-    return model(images, right_images)
-
-
-def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, model_name):
-    # Train for one epoch
-    model.train()
-    tracker = MetricsTracker()
+def train_one_epoch(model, train_loader, criterion,
+                    optimizer, device, epoch,
+                    is_bilateral, writer=None):
     
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]")
-    for images, labels, _ in pbar:
-        images = images.to(device)
-        labels = labels.to(device)
-        
+    model.train()
+    tracker = MetricsTracker(num_classes=3)
+
+    pbar = tqdm(
+        train_loader,
+        desc=f"Epoch {epoch:>3} [Train]",
+        leave=False
+    )
+
+    for step, batch in enumerate(pbar):
+        logits, labels = forward_pass(
+            model, batch, is_bilateral, device
+        )
+
+        loss = criterion(logits, labels)
+
         optimizer.zero_grad()
-        outputs = _forward_with_mode(model, model_name, images)
-        loss = criterion(outputs, labels)
-        
         loss.backward()
         optimizer.step()
-        
-        preds = torch.argmax(outputs, dim=1)
+
+        preds = torch.argmax(logits, dim=1)
         tracker.update(preds, labels, loss.item())
-        
+
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-    
+
+        if writer is not None:
+            global_step = (epoch - 1) * len(train_loader) + step
+            writer.add_scalar('Train/StepLoss', loss.item(), global_step)
+
     metrics = tracker.compute()
     return metrics
 
+def evaluate_epoch(model, loader, criterion,
+                   device, epoch, is_bilateral,
+                   split_name='Val'):
 
-def evaluate(model, test_loader, criterion, device, epoch, model_name):
-    # Evaluate model
     model.eval()
-    tracker = MetricsTracker()
-    
-    pbar = tqdm(test_loader, desc=f"Epoch {epoch} [Eval]")
+    tracker = MetricsTracker(num_classes=3)
+
+    pbar = tqdm(
+        loader,
+        desc=f"Epoch {epoch:>3} [{split_name}]",
+        leave=False
+    )
+
     with torch.no_grad():
-        for images, labels, _ in pbar:
-            images = images.to(device)
-            labels = labels.to(device)
-            
-            outputs = _forward_with_mode(model, model_name, images)
-            loss = criterion(outputs, labels)
-            
-            preds = torch.argmax(outputs, dim=1)
+        for batch in pbar:
+            logits, labels = forward_pass(
+                model, batch, is_bilateral, device
+            )
+            loss  = criterion(logits, labels)
+            preds = torch.argmax(logits, dim=1)
             tracker.update(preds, labels, loss.item())
-            
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-    
+
     metrics = tracker.compute()
     return metrics
-
 
 def train(
-    config_path='config/config.yaml',
-    num_epochs=50,
-    save_dir='models',
-    model_name='baseline_cnn',
-    run_tag=None,
-    overrides=None,
-    train_csv='data/processed/train_triage_labels.csv',
-    test_csv='data/processed/test_triage_labels.csv',
-    train_img_dir='data/processed/images/train',
-    test_img_dir='data/processed/images/test',
-    image_size=512,
-    seed=42,
-    auto_class_weights=False,
-    checkpoint_interval=5,
-    save_final_model=True,
+    config_path   = 'config/config.yaml',
+    model_name    = 'baseline_cnn',
+    seed          = 42,
+    num_epochs    = 50,
+    multisource   = False,
+    save_dir      = 'checkpoints',
+    run_tag       = None,
+    auto_weights  = True,
 ):
-    # Main training function
-    print("=" * 70)
-    print(f"TRAINING MODEL: {model_name}")
-    print("=" * 70)
     
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
-    
+
     set_seed(seed)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n Device: {device}")
-    
-    print(f"\n Loading data...")
-    train_loader, test_loader, dataset_info = get_dataloaders(
-        train_csv=train_csv,
-        test_csv=test_csv,
-        train_img_dir=train_img_dir,
-        test_img_dir=test_img_dir,
-        batch_size=config['training']['batch_size'],
-        num_workers=config['gpu'].get('num_workers', 4),
-        pin_memory=config['gpu'].get('pin_memory', True),
-        image_size=image_size,
+    device = torch.device(
+        'cuda' if torch.cuda.is_available() else 'cpu'
     )
-    
-    print(f" Data loaded:")
-    print(f"   Train: {dataset_info['train_size']} images")
-    print(f"   Test: {dataset_info['test_size']} images")
-    
-    print(f"\n Creating model...")
-    model, model_label = _build_model(model_name, config, overrides=overrides)
-    model = model.to(device)
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f" Model created: {model_label}")
-    print(f"   Parameters: {total_params:,}")
-    if model_name != 'baseline_cnn':
-        print("   Input mode: synthetic bilateral (left=original, right=horizontal-flip)")
-    
-    if auto_class_weights:
-        auto_weights = compute_auto_class_weights(train_csv)
-        class_weights = torch.tensor(auto_weights, dtype=torch.float32).to(device)
-    else:
-        class_weights = torch.tensor(config['training']['class_weights'], dtype=torch.float32).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-    
-    learning_rate = float(config['training']['learning_rate'])
-    weight_decay = float(config['training']['weight_decay'])
 
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=weight_decay
+    ms_tag   = '_MS' if multisource else ''
+    run_name = f"{model_name}{ms_tag}_seed{seed}"
+    if run_tag:
+        run_name = f"{run_name}_{run_tag}"
+
+    print("=" * 70)
+    print(f"  VisionTriage Training")
+    print(f"  Model:       {model_name}{ms_tag}")
+    print(f"  Seed:        {seed}")
+    print(f"  Multisource: {multisource}")
+    print(f"  Device:      {device}")
+    print(f"  Run:         {run_name}")
+    print("=" * 70)
+
+    ds_cfg = config['dataset']
+
+    _, is_bilateral_check = get_model(model_name)
+    from src.models import BILATERAL_MODELS
+    is_bilateral = BILATERAL_MODELS.get(model_name, False)
+
+    print(f"\n  Loading data (bilateral={is_bilateral})...")
+
+    if multisource:
+        # M3-MS
+        train_loader, test_loader, dataset_info = \
+            get_multisource_dataloaders(
+                idrid_train_csv     = ds_cfg['train_csv'],
+                idrid_train_img_dir = ds_cfg['train_image_dir'],
+                dodr_train_csv      = ds_cfg.get('dodr_train_csv', ''),
+                dodr_train_img_dir  = ds_cfg.get('dodr_image_dir', ''),
+                idrid_test_csv      = ds_cfg['test_csv'],
+                idrid_test_img_dir  = ds_cfg['test_image_dir'],
+                batch_size          = config['training']['batch_size'],
+                num_workers         = config['gpu'].get('num_workers', 4),
+                pin_memory          = config['gpu'].get('pin_memory', True),
+                bilateral           = is_bilateral,
+                label_col           = ds_cfg.get(
+                    'diagnosis_column', 'Retinopathy grade'
+                ),
+            )
+    else:
+        # IDRiD-only
+        train_loader, test_loader, dataset_info = get_dataloaders(
+            train_csv     = ds_cfg['train_csv'],
+            test_csv      = ds_cfg['test_csv'],
+            train_img_dir = ds_cfg['train_image_dir'],
+            test_img_dir  = ds_cfg['test_image_dir'],
+            batch_size    = config['training']['batch_size'],
+            num_workers   = config['gpu'].get('num_workers', 4),
+            pin_memory    = config['gpu'].get('pin_memory', True),
+            bilateral     = is_bilateral,
+            label_col     = ds_cfg.get(
+                'diagnosis_column', 'Retinopathy grade'
+            ),
+        )
+
+    print(f"  Train samples: {dataset_info['train_size']}")
+    print(f"  Test samples:  {dataset_info['test_size']}")
+
+    print(f"\n  Building model: {model_name}...")
+
+    model_cfg = {}
+    if model_name in ('baseline_cnn', 'm1'):
+        model_cfg = {
+            'num_classes': 3,
+            'pretrained':  config['models']['baseline_cnn']['pretrained'],
+            'dropout':     config['models']['baseline_cnn'].get('dropout', 0.5),
+        }
+    elif model_name in ('late_concat', 'm2'):
+        model_cfg = {
+            'num_classes':   3,
+            'pretrained':    config['models']['baseline_concat']['pretrained'],
+            'fc_hidden_dim': config['models']['baseline_concat']['fc_hidden_dim'],
+            'dropout':       config['models']['baseline_concat'].get('dropout', 0.5),
+        }
+    elif model_name in ('cross_attention', 'm3'):
+        model_cfg = {
+            'num_classes':   3,
+            'pretrained':    config['models']['proposed_crossattn']['pretrained'],
+            'attn_dim':      config['models']['proposed_crossattn']['attn_dim'],
+            'num_heads':     config['models']['proposed_crossattn']['num_heads'],
+            'fc_hidden_dim': config['models']['proposed_crossattn']['fc_hidden_dim'],
+            'dropout':       config['models']['proposed_crossattn'].get('dropout', 0.5),
+        }
+
+    model, is_bilateral = get_model(model_name, model_cfg)
+    model = model.to(device)
+
+    total_params     = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(
+        p.numel() for p in model.parameters() if p.requires_grad
     )
-    
+    print(f"  Total params:     {total_params:,}")
+    print(f"  Trainable params: {trainable_params:,}")
+
+    print(f"\n  Computing class weights...")
+
+    if auto_weights:
+        class_weights = compute_class_weights(
+            train_loader, device, num_classes=3
+        )
+    else:
+        weights = config['training']['class_weights']
+        class_weights = torch.tensor(
+            weights, dtype=torch.float32
+        ).to(device)
+        print(f"  Class weights (config): {weights}")
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    lr           = float(config['training']['learning_rate'])   # 1e-4
+    weight_decay = float(config['training']['weight_decay'])    # 1e-5
+
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr           = lr,
+        weight_decay = weight_decay,
+    )
+
+    print(f"\n  Optimiser: AdamW (lr={lr}, wd={weight_decay})")
+
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=num_epochs
+        T_max   = num_epochs,   # Full training duration
+        eta_min = 0.0,          # Reduce to zero
     )
-    
-    early_stopping = EarlyStopping(
-        patience=config['training']['early_stopping']['patience'],
-        mode='max',
-        min_delta=0.001
-    )
-    
-    run_name = model_name if not run_tag else f"{model_name}_{run_tag}"
 
-    log_dir = Path(config['logging']['tensorboard_dir']) / run_name
-    writer = SummaryWriter(log_dir=log_dir)
-    
+    print(f"  Scheduler: CosineAnnealingLR (T_max={num_epochs}, eta_min=0.0)")
+
+    early_stopping = EarlyStopping(
+        patience  = config['training']['early_stopping']['patience'],
+        mode      = 'max',
+        min_delta = 0.001,
+    )
+
+    log_dir  = Path(config['logging']['tensorboard_dir']) / run_name
     save_dir = Path(save_dir) / run_name
     save_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"\n Training configuration:")
-    print(f"   Seed: {seed}")
-    print(f"   Epochs: {num_epochs}")
-    print(f"   Batch size: {config['training']['batch_size']}")
-    print(f"   Train CSV: {train_csv}")
-    print(f"   Test CSV: {test_csv}")
-    print(f"   Learning rate: {learning_rate}")
-    print(f"   Weight decay: {weight_decay}")
-    if auto_class_weights:
-        print(f"   Class weights (auto from train CSV): {class_weights.detach().cpu().tolist()}")
-    else:
-        print(f"   Class weights (config): {config['training']['class_weights']}")
-        print(f"   Checkpoint interval: {checkpoint_interval}")
-        print(f"   Save final model: {save_final_model}")
-    print(f"   Early stopping patience: {config['training']['early_stopping']['patience']}")
-    
+
+    writer = SummaryWriter(log_dir=str(log_dir))
+    print(f"\n  Checkpoints: {save_dir}")
+    print(f"  TensorBoard: {log_dir}")
+
     print(f"\n{'=' * 70}")
-    print("STARTING TRAINING")
-    print("=" * 70)
-    
-    best_f1 = 0.0
-    history = {'train': [], 'test': []}
-    
+    print(f"  STARTING TRAINING — max {num_epochs} epochs")
+    print(f"{'=' * 70}\n")
+
+    best_f1       = 0.0
+    best_epoch    = 0
+    history       = {'train': [], 'val': []}
+
     for epoch in range(1, num_epochs + 1):
-        print(f"\nEpoch {epoch}/{num_epochs}")
-        print("-" * 70)
-        
-        train_metrics = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, model_name)
-        
-        test_metrics = evaluate(model, test_loader, criterion, device, epoch, model_name)
-        
-        scheduler.step()
-        
-        writer.add_scalar('Loss/train', train_metrics['avg_loss'], epoch)
-        writer.add_scalar('Loss/test', test_metrics['avg_loss'], epoch)
-        writer.add_scalar('Accuracy/train', train_metrics['accuracy'], epoch)
-        writer.add_scalar('Accuracy/test', test_metrics['accuracy'], epoch)
-        writer.add_scalar('F1/train', train_metrics['f1_macro'], epoch)
-        writer.add_scalar('F1/test', test_metrics['f1_macro'], epoch)
-        writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], epoch)
-        
-        print(f"\n Train Metrics:")
-        MetricsTracker().print_metrics(train_metrics, prefix="  ")
-        print(f"\n Test Metrics:")
-        MetricsTracker().print_metrics(test_metrics, prefix="  ")
-        
-        history['train'].append(train_metrics)
-        history['test'].append(test_metrics)
-        
-        if test_metrics['f1_macro'] > best_f1:
-            best_f1 = test_metrics['f1_macro']
-            save_checkpoint(
-                model, optimizer, epoch, test_metrics,
-                save_dir, filename='best_model.pth'
-            )
-            print(f"New best F1: {best_f1:.4f}")
-        
-        if checkpoint_interval > 0 and epoch % checkpoint_interval == 0:
-            save_checkpoint(
-                model, optimizer, epoch, test_metrics,
-                save_dir, filename=f'checkpoint_epoch_{epoch}.pth'
-            )
-        
-        if early_stopping(test_metrics['f1_macro']):
-            print(f"\n Early stopping at epoch {epoch}")
-            break
-    
-    if save_final_model:
-        save_checkpoint(
-            model, optimizer, epoch, test_metrics,
-            save_dir, filename='final_model.pth'
+        train_metrics = train_one_epoch(
+            model, train_loader, criterion,
+            optimizer, device, epoch,
+            is_bilateral, writer
         )
-    
-    save_metrics_json(history, save_dir / 'training_history.json')
-    
-    writer.close()
-    
+
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+
+        val_metrics = evaluate_epoch(
+            model, test_loader, criterion,
+            device, epoch, is_bilateral,
+            split_name='Val'
+        )
+
+        val_f1 = val_metrics['f1_macro']
+
+        writer.add_scalar('Train/MacroF1',  train_metrics['f1_macro'], epoch)
+        writer.add_scalar('Train/Loss',     train_metrics['avg_loss'], epoch)
+        writer.add_scalar('Val/MacroF1',    val_f1,                    epoch)
+        writer.add_scalar('Val/Loss',       val_metrics['avg_loss'],   epoch)
+        writer.add_scalar('Val/Kappa',      val_metrics['kappa'],      epoch)
+        writer.add_scalar('LR',             current_lr,                epoch)
+
+        print(
+            f"Epoch {epoch:>3}/{num_epochs} | "
+            f"Train F1: {train_metrics['f1_macro']:.4f} | "
+            f"Val F1: {val_f1:.4f} | "
+            f"LR: {current_lr:.2e} | "
+            f"Best: {best_f1:.4f}"
+        )
+
+        improved = early_stopping.step(val_f1)
+
+        if improved:
+            best_f1    = val_f1
+            best_epoch = epoch
+
+            # Save best checkpoint
+            save_checkpoint(
+                model      = model,
+                optimizer  = optimizer,
+                epoch      = epoch,
+                metrics    = val_metrics,
+                checkpoint_dir = str(save_dir),
+                filename   = 'best_checkpoint.pth',
+            )
+
+            print(f"  New best Macro-F1: {best_f1:.4f} "
+                  f"(epoch {best_epoch})")
+
+        if epoch % 10 == 0:
+            save_checkpoint(
+                model, optimizer, epoch, val_metrics,
+                str(save_dir),
+                filename=f'checkpoint_epoch{epoch}.pth',
+            )
+
+        if early_stopping.stop:
+            print(f"\n  Early stopping triggered at epoch {epoch} "
+                  f"(patience={early_stopping.patience})")
+            break
+
+        history['train'].append(train_metrics)
+        history['val'].append(val_metrics)
+
     print(f"\n{'=' * 70}")
-    print("TRAINING COMPLETE!")
-    print("=" * 70)
-    print(f"\n Best Test F1: {best_f1:.4f}")
-    print(f" Models saved to: {save_dir}")
-    print(f" TensorBoard logs: {log_dir}")
-    print(f"\nTo view TensorBoard:")
-    print(f"  tensorboard --logdir={log_dir}")
-    
-    return model, history
+    print(f"  Training complete")
+    print(f"  Best Val Macro-F1: {best_f1:.4f} at epoch {best_epoch}")
+    print(f"{'=' * 70}\n")
+
+    # Save training history
+    save_metrics_json(
+        {'best_f1': best_f1, 'best_epoch': best_epoch,
+         'history': {
+             'train_f1': [m['f1_macro'] for m in history['train']],
+             'val_f1':   [m['f1_macro'] for m in history['val']],
+         }},
+        str(save_dir),
+        filename='training_history.json',
+    )
+
+    writer.close()
+    return best_f1, run_name
+
+def run_all_seeds(config_path, model_name, multisource=False,
+                 seeds=None, **kwargs):
+    if seeds is None:
+        seeds = [42, 0, 123]
+
+    print(f"\n{'=' * 70}")
+    print(f"  THREE-SEED ROBUSTNESS RUN")
+    print(f"  Model: {model_name} | Multisource: {multisource}")
+    print(f"  Seeds: {seeds}")
+    print(f"{'=' * 70}\n")
+
+    f1_scores  = []
+    run_names  = []
+
+    for seed in seeds:
+        print(f"\n{'-' * 70}")
+        print(f"  Running seed {seed}...")
+        print(f"{'-' * 70}")
+
+        best_f1, run_name = train(
+            config_path = config_path,
+            model_name  = model_name,
+            seed        = seed,
+            multisource = multisource,
+            **kwargs,
+        )
+
+        f1_scores.append(best_f1)
+        run_names.append(run_name)
+
+        print(f"\n  Seed {seed} complete - Best F1: {best_f1:.4f}")
+
+    # Compute robustness statistics
+    robustness = compute_seed_robustness(f1_scores)
+
+    print(f"\n{'=' * 70}")
+    print(f"  SEED ROBUSTNESS RESULTS")
+    print(f"{'=' * 70}")
+    for seed, f1 in zip(seeds, f1_scores):
+        print(f"  Seed {seed:>3}: {f1:.4f}")
+    print(f"  {'-' * 30}")
+    print(f"  Mean ± SD: {robustness['formatted']}")
+    print(f"  Range:     {robustness['range']:.4f}")
+    print(f"  CV:        {robustness['cv_pct']:.2f}%")
+    print(f"{'=' * 70}\n")
+
+    return robustness
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='VisionTriage Training Script',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument(
+        '--model', type=str, default='baseline_cnn',
+        choices=['baseline_cnn', 'late_concat', 'cross_attention',
+                 'm1', 'm2', 'm3'],
+        help='Model architecture to train'
+    )
+    parser.add_argument(
+        '--config', type=str, default='config/config.yaml',
+        help='Path to config YAML file'
+    )
+    parser.add_argument(
+        '--seed', type=int, default=42,
+        help='Random seed'
+    )
+    parser.add_argument(
+        '--epochs', type=int, default=50,
+        help='Maximum training epochs'
+    )
+    parser.add_argument(
+        '--multisource', action='store_true',
+        help='Multisource training (M3-MS)'
+    )
+    parser.add_argument(
+        '--all-seeds', action='store_true',
+        help='Run all seeds'
+    )
+    parser.add_argument(
+        '--save-dir', type=str, default='checkpoints',
+        help='Directory to save checkpoints'
+    )
+    parser.add_argument(
+        '--tag', type=str, default=None,
+        help='Optional run tag appended to run name'
+    )
+    parser.add_argument(
+        '--no-auto-weights', action='store_true',
+        help='Use config class weights instead of auto-computed'
+    )
+
+    return parser.parse_args()
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train Triage Models')
-    parser.add_argument('--config', type=str, default='config/config.yaml',
-                       help='Path to config file')
-    parser.add_argument('--epochs', type=int, default=50,
-                       help='Number of epochs')
-    parser.add_argument('--save_dir', type=str, default='models',
-                       help='Directory to save models')
-    parser.add_argument('--model', type=str, default='baseline_cnn',
-                       choices=['baseline_cnn', 'late_concat', 'cross_attention'],
-                       help='Model to train')
-    parser.add_argument('--run_tag', type=str, default=None,
-                       help='Optional run suffix for output dirs (e.g., ablation_h4)')
-    parser.add_argument('--num_heads', type=int, default=None,
-                       help='Override num_heads for cross_attention model')
-    parser.add_argument('--attn_dim', type=int, default=None,
-                       help='Override attn_dim for cross_attention model')
-    parser.add_argument('--train_csv', type=str, default='data/processed/train_triage_labels.csv',
-                       help='Path to training CSV')
-    parser.add_argument('--test_csv', type=str, default='data/processed/test_triage_labels.csv',
-                       help='Path to test CSV')
-    parser.add_argument('--train_img_dir', type=str, default='data/processed/images/train',
-                       help='Fallback train image directory when CSV has no image_path column')
-    parser.add_argument('--test_img_dir', type=str, default='data/processed/images/test',
-                       help='Fallback test image directory when CSV has no image_path column')
-    parser.add_argument('--image_size', type=int, default=512,
-                       help='Image size for resize before normalization')
-    parser.add_argument('--seed', type=int, default=42,
-                       help='Random seed for reproducibility')
-    parser.add_argument('--auto_class_weights', action='store_true',
-                       help='Compute inverse-frequency class weights from training CSV')
-    parser.add_argument('--checkpoint_interval', type=int, default=5,
-                       help='Save epoch checkpoints every N epochs (0 disables)')
-    parser.add_argument('--no_final_model', action='store_true',
-                       help='Do not save final_model.pth (best_model is still saved)')
-    
-    args = parser.parse_args()
-    
-    overrides = {}
-    if args.num_heads is not None:
-        overrides['num_heads'] = args.num_heads
-    if args.attn_dim is not None:
-        overrides['attn_dim'] = args.attn_dim
+    args = parse_args()
 
-    model, history = train(
-        config_path=args.config,
-        num_epochs=args.epochs,
-        save_dir=args.save_dir,
-        model_name=args.model,
-        run_tag=args.run_tag,
-        overrides=overrides,
-        train_csv=args.train_csv,
-        test_csv=args.test_csv,
-        train_img_dir=args.train_img_dir,
-        test_img_dir=args.test_img_dir,
-        image_size=args.image_size,
-        seed=args.seed,
-        auto_class_weights=args.auto_class_weights,
-        checkpoint_interval=args.checkpoint_interval,
-        save_final_model=not args.no_final_model,
-    )
+    if args.all_seeds:
+        run_all_seeds(
+            config_path = args.config,
+            model_name  = args.model,
+            multisource = args.multisource,
+            num_epochs  = args.epochs,
+            save_dir    = args.save_dir,
+            run_tag     = args.tag,
+            auto_weights = not args.no_auto_weights,
+        )
+    else:
+        # Single seed run
+        best_f1, run_name = train(
+            config_path  = args.config,
+            model_name   = args.model,
+            seed         = args.seed,
+            num_epochs   = args.epochs,
+            multisource  = args.multisource,
+            save_dir     = args.save_dir,
+            run_tag      = args.tag,
+            auto_weights = not args.no_auto_weights,
+        )
+
+        print(f"\nFinal best Macro-F1: {best_f1:.4f}")
+        print(f"Run name: {run_name}")
