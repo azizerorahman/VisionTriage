@@ -1,8 +1,14 @@
+<div align="center">
+
 # VisionTriage: Cross-Attention Fusion for Fundus Image-Based Diabetic Retinopathy Triage
+
+![VisionTriage Banner](/assets/banner.png)
 
 [![Triage](https://img.shields.io/badge/Vision-Triage-red.svg)]()
 [![Thesis](https://img.shields.io/badge/Thesis-Sichuan%20University-lightgrey.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+</div>
 
 This codebase belongs to the thesis: *"Bidirectional Cross-Attention Fusion of Bilateral Fundus Images for Three-Tier Diabetic Retinopathy Urgency Triage (VisionTriage)"* **Sichuan University, 2026**
 
