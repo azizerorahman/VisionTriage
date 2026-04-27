@@ -60,3 +60,15 @@ models/**/*.pth
 models/**/*.pt
 models/**/training_history.json
 models/**/checkpoint_*.pth
+
+# Python cache and logs
+__pycache__/
+__init__.py[cod]
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+
